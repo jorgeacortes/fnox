@@ -200,7 +200,7 @@ async fn handle(mut stream: TcpStream, state: &PageState) -> Result<()> {
         Ok(Ok(request)) => request,
         Ok(Err(e)) => {
             respond(&mut stream, 400, &message_page("Bad request", ""), None).await?;
-            return Err(FnoxError::Config(e));
+            return Err(FnoxError::Config(e.to_string()));
         }
         Err(_) => return Ok(()),
     };

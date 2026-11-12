@@ -273,6 +273,34 @@ async fn explicit_empty_request_body_is_allowed() {
     assert!(request.body.is_empty());
 }
 
+#[tokio::test]
+async fn a_body_over_the_limit_is_refused_with_413() {
+    let (mut client, mut server) = tokio::io::duplex(4096);
+    let declared = MAX_BODY_BYTES + 1;
+    client
+        .write_all(
+            format!(
+                "POST /repos/example/fnox HTTP/1.1\r\nhost: api.github.com\r\ncontent-length: {declared}\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let plan = policy();
+    proxy_http_request(&mut server, "api.github.com", &plan.policy)
+        .await
+        .unwrap();
+    drop(server);
+
+    let mut response = String::new();
+    client.read_to_string(&mut response).await.unwrap();
+
+    assert!(response.starts_with("HTTP/1.1 413 Content Too Large\r\n"));
+    assert!(response.contains(&format!("request body is {declared} B")));
+    assert!(response.contains(&format!("{} B limit", MAX_BODY_BYTES)));
+}
+
 #[test]
 fn rejects_overlapping_placeholders() {
     let mut config = config();

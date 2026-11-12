@@ -1,15 +1,44 @@
 //! Minimal HTTP/1.1 request reading for fnox's loopback listeners: the
 //! credential proxy and the `request_secret` page.
 //!
-//! Errors are plain messages; each caller wraps them in its own error.
+//! Errors carry the status to answer with and a plain message.
 
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, BufReader};
 
 /// Largest request line plus headers that is read
 pub(crate) const MAX_HEADER_BYTES: usize = 64 * 1024;
 
-fn http_error(message: impl Into<String>) -> String {
-    message.into()
+/// Why a request could not be read
+pub(crate) enum ReadError {
+    /// The body is larger than the caller's limit
+    BodyTooLarge { declared: usize, limit: usize },
+    /// The request line, headers, or body are not usable
+    Message(String),
+}
+
+impl ReadError {
+    /// Status a loopback listener answers with
+    pub(crate) fn status(&self) -> u16 {
+        match self {
+            Self::BodyTooLarge { .. } => 413,
+            Self::Message(_) => 400,
+        }
+    }
+}
+
+impl std::fmt::Display for ReadError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BodyTooLarge { declared, limit } => {
+                write!(f, "request body is {declared} B, larger than the {limit} B limit")
+            }
+            Self::Message(message) => f.write_str(message),
+        }
+    }
+}
+
+fn http_error(message: impl Into<String>) -> ReadError {
+    ReadError::Message(message.into())
 }
 
 /// Compare two byte strings in time that depends only on their lengths
@@ -34,12 +63,14 @@ pub(crate) struct HttpRequest {
 pub(crate) async fn read_http_request_limited<S>(
     stream: &mut S,
     max_body: usize,
-) -> Result<HttpRequest, String>
+) -> Result<HttpRequest, ReadError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mut reader = BufReader::new(stream);
-    let request_line = read_line_limited(&mut reader, MAX_HEADER_BYTES).await?;
+    let request_line = read_line_limited(&mut reader, MAX_HEADER_BYTES)
+        .await
+        .map_err(http_error)?;
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or_default().to_ascii_uppercase();
     let target = parts.next().unwrap_or_default().to_string();
@@ -52,7 +83,9 @@ where
     let mut header_bytes = request_line.len();
     let mut content_length = None;
     loop {
-        let line = read_line_limited(&mut reader, MAX_HEADER_BYTES - header_bytes).await?;
+        let line = read_line_limited(&mut reader, MAX_HEADER_BYTES - header_bytes)
+            .await
+            .map_err(http_error)?;
         header_bytes += line.len();
         if line == "\r\n" || line == "\n" {
             break;
@@ -83,7 +116,10 @@ where
     }
     let content_length = content_length.unwrap_or(0);
     if content_length > max_body {
-        return Err(http_error("request body exceeded proxy limit"));
+        return Err(ReadError::BodyTooLarge {
+            declared: content_length,
+            limit: max_body,
+        });
     }
     let mut body = vec![0; content_length];
     reader
